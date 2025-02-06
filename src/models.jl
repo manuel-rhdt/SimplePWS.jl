@@ -1,4 +1,3 @@
-# models.jl
 module Models
 
 using Random, Distributions, LinearAlgebra

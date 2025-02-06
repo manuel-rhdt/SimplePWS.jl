@@ -1,5 +1,6 @@
 module MutualInformation
 
+using Statistics
 using StatsFuns
 using Distributions
 
