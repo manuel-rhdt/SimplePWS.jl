@@ -7,20 +7,36 @@ export BirthDeathModel, NonlinearModel, StochasticModel, log_probability, initia
 
 abstract type StochasticModel end
 
-initial_state(model::StochasticModel, generate::Bool; vals...) = error("unimplemented")
+initial_state(model::StochasticModel, generate::Bool) = error("unimplemented")
+copy_state(model::StochasticModel, state) = error("unimplemented")
 
 function (model::StochasticModel)(generate::Bool = false; vals...)
-    init_state = initial_state(model, generate; vals...)
+    init_state = initial_state(model, generate)
 
-    length = size(pairs(vals)[1], 2)
+    len = minimum(length, values(vals))
 
-    state = foldl(range(2, length); init=init_state) do state, i
-        x = map(v -> (@view v[:, i]), (; vals...))
-        step(model, state; x...)
+    if generate
+        logp = zeros(len)
+        state = foldl(range(; length=len); init=init_state) do state, i
+            v = map(v -> v[i], (; vals...))
+            state, (l, out) = step(model, state; v...)
+            logp[i] = l
+            for (k, v) in pairs(out)
+                vals[k][i] = v
+            end
+            state
+        end
+        logp
+    else
+        logp = zeros(len)
+        state = foldl(range(; length=len); init=init_state) do state, i
+            v = map(v -> v[i], (; vals...))
+            state, l = step(model, state; v...)
+            logp[i] = l
+            state
+        end
+        logp
     end
-
-    _, logp, _ = state
-    logp
 end
 
 struct BirthDeathModel <: StochasticModel
