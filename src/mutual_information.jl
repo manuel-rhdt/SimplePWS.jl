@@ -74,8 +74,12 @@ function mutual_information(input_model::StochasticModel, output_model::Stochast
 
     log_m, ess = smc_estimate(input_model, output_model, x, n_particles)
     time = collect(1:num_steps) .* dt
-    mi = dropdims(mean(log_c .- log_m, dims=2); dims=2)
-    variance = dropdims(var(log_c .- log_m, dims=2); dims=2)
+    # log_c holds the per-step joint log density of the observation; log_m is the
+    # cumulative marginal log likelihood. Accumulate the former before comparing,
+    # otherwise MI(t) is off by everything the marginal has accumulated so far.
+    log_c_cumulative = cumsum(log_c, dims=1)
+    mi = dropdims(mean(log_c_cumulative .- log_m, dims=2); dims=2)
+    variance = dropdims(var(log_c_cumulative .- log_m, dims=2); dims=2)
     return Dict(
         :Time => time,
         :MutualInformation => mi,

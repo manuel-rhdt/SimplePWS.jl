@@ -10,6 +10,15 @@ abstract type StochasticModel end
 initial_state(model::StochasticModel, generate::Bool) = error("unimplemented")
 copy_state(model::StochasticModel, state) = error("unimplemented")
 
+# Step protocol used everywhere (see MutualInformation.smc_run):
+#
+#   initial_state(model, generate)                -> carry
+#   step(model, carry)                            -> (carry, (logp, (; s = value)))
+#   step(model, carry; x = observation, s = ...)  -> (carry, logp)
+#   copy_state(model, carry)                      -> carry
+#
+# A carry is immutable and holds everything needed for the next step, so
+# copy_state is the identity for the scalar models below.
 function (model::StochasticModel)(generate::Bool = false; vals...)
     init_state = initial_state(model, generate)
 
@@ -39,6 +48,12 @@ function (model::StochasticModel)(generate::Bool = false; vals...)
     end
 end
 
+"""
+    BirthDeathModel(birth, death, dt)
+
+Linear birth-death process in the chemical Langevin approximation. `s` is
+centred: it has mean zero and stationary variance `birth / death`.
+"""
 struct BirthDeathModel <: StochasticModel
     birth::Float64
     death::Float64
@@ -53,96 +68,86 @@ struct NonlinearModel <: StochasticModel
     dt::Float64
 end
 
-function initial_state(model::BirthDeathModel, generate::Bool = false; s::AbstractMatrix{Float64})
-    mu = model.birth / model.death
-    if generate
-        for i in axes(s, 1)
-            s[i, 1] = randn() * sqrt(mu)
-        end
-    end
+variance_scale(model::BirthDeathModel) = model.birth / model.death
 
-    s0 = s[:, 1]
-    logp_init = logpdf(Normal(0, sqrt(mu)), s0)
-    return Val(generate), logp_init, s0
+# Same convention as ARModel: the carry starts from a fixed value in both
+# generate and score mode, so a generated series scores to the same log
+# likelihood that generated it. The process is centred, so s0 = 0 is the
+# stationary mean; only the first few steps see the transient.
+function initial_state(model::BirthDeathModel, generate::Bool = false; kw...)
+    return Val(generate), 0.0, 0.0
 end
 
-function step(model::BirthDeathModel, carry::Tuple{Val, Vector{Float64}, Vector{Float64}}; s::AbstractArray{Float64})
-    generate, logp, s_prev = carry
+copy_state(::BirthDeathModel, state::Tuple) = state
+
+function step(model::BirthDeathModel, carry::Tuple{Val, Float64, Float64}; s = nothing)
+    generate, logp_init, s_prev = carry
     sigma = sqrt(2 * model.birth * model.dt)
-    mu = model.birth / model.death
+    mu = variance_scale(model)
+    # drift of the centred variable: relaxes to zero, stationary variance mu
+    ds = model.dt * (model.birth - model.death * (s_prev + mu))
 
-    @simd for i in axes(s, 1)
-        @inbounds ds = model.dt * (model.birth - model.death * (s_prev[i] + mu))
-        if generate === Val(true)
-            @inbounds s[i] = s_prev[i] + ds + sigma * randn()
-        end
-        @inbounds logp[i] += logpdf(Normal(0, sigma), s[i] - (s_prev[i] + ds))
+    if generate === Val(true)
+        s_new = s_prev + ds + sigma * randn()
+        logp = logpdf(Normal(0, sigma), s_new - (s_prev + ds))
+        return (generate, logp_init, s_new), (logp, (; s = s_new))
+    else
+        s_new = s === nothing ? s_prev : Float64(s)
+        logp = logpdf(Normal(0, sigma), s_new - (s_prev + ds))
+        return (generate, logp_init, s_new), logp
     end
-
-    s_prev .= s
-    return (generate, logp, s_prev)
 end
 
-
-function initial_state(::NonlinearModel, generate::Bool = false; s::AbstractMatrix{Float64}, x::AbstractMatrix{Float64})
-    if generate
-        x[:, 1] .= zero(eltype(x))
-    end
-    x_prev = x[:, 1]
-    logp = zeros(max(size(x, 1), size(s, 1)))
-    return Val(generate), logp, x_prev
+function initial_state(::NonlinearModel, generate::Bool = false; kw...)
+    return Val(generate), 0.0
 end
+
+copy_state(::NonlinearModel, state::Tuple) = state
+
+# saturating response; log1p throws for s/K < -1, where the response is 0
+function response(model::NonlinearModel, s)
+    z = s / model.K
+    z <= -1 && return 0.0
+    a = logistic(model.n * log1p(z))
+    return isnan(a) ? 0.0 : a
+end
+
+drift(model::NonlinearModel, s, x) =
+    response(model, s) * model.rho - model.mu * (x + 0.5 * model.rho / model.mu)
 
 # Define the step function for NonlinearModel
-function step(
-    model::NonlinearModel, 
-    carry::Tuple{Val, Vector{Float64}, Vector{Float64}};
-    s::AbstractVector{Float64},
-    x::AbstractVector{Float64}
-    )
-    mean_x = 0.5 * model.rho / model.mu
+function step(model::NonlinearModel, carry::Tuple{Val, Float64}; s, x = nothing)
+    generate, x_prev = carry
     sigma = sqrt(model.rho * model.dt)
-    generate, logp, x_prev = carry
-    dim = max(size(s, 1), size(x, 1))
+    dx = model.dt * drift(model, Float64(s), x_prev)
 
-    function drift(s, x)
-        a = logistic(model.n * log1p(s / model.K))
-        a = isnan(a) ? 0.0 : a
-        a * model.rho - model.mu * (x + mean_x)
+    if generate === Val(true)
+        dW = sigma * randn()
+        x_new = x_prev + dx + dW
+        logp = logpdf(Normal(0, sigma), dW)
+        return (generate, x_new), (logp, (; x = x_new))
+    else
+        x_new = x === nothing ? x_prev : Float64(x)
+        logp = logpdf(Normal(0, sigma), x_new - (x_prev + dx))
+        return (generate, x_new), logp
     end
-
-    for i in 1:dim
-        ix = min(i, size(x, 1))
-        is = min(i, size(s, 1))
-
-        @inbounds if generate === Val(true)
-            dx = model.dt * drift(s[is], x_prev[ix])
-            dW = sigma * randn()
-            x[ix] = x_prev[ix] + dx + dW
-            logp[i] += logpdf(Normal(0, sigma), dW)
-        else
-            dx = model.dt * drift(s[is], x_prev[ix])
-            logp[i] += logpdf(Normal(0, sigma), x_prev[ix] + dx - x[ix])
-        end
-    end
-    
-    x_prev .= x
-    return (generate, logp, x_prev)
 end
 
 
+"""
+    log_probability(model; s = trajectories[, x = trajectories])
+
+Joint log density of the given trajectories under the model, one column per
+trajectory. Returns a `time x trajectories` matrix.
+"""
 function log_probability(model::StochasticModel; vals...)
-    state = initial_state(model, false; vals...)
+    first_series = first(values(vals))
+    ncols = size(first_series, 2)
+    logp = zeros(size(first_series, 1), ncols)
 
-    batch = max(size.(values((; vals...)), 1)...)
-    length = size(pairs(vals)[1], 2)
-
-    logp = zeros(batch, length)
-
-    for i in range(2, length)
-        v = map(v -> (@view v[:, i]), (; vals...))
-        state = step(model, state; v...)
-        logp[:, i] .= state[2]
+    for j in 1:ncols
+        v = map(v -> view(v, :, j), (; vals...))
+        logp[:, j] .= (model)(false; v...)
     end
 
     logp
